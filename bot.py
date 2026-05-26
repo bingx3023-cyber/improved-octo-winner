@@ -35,8 +35,8 @@ MIN_VOLUME = 20_000_000
 MIN_MARKET_CAP = 100_000_000
 MIN_PRICE_CHANGE = 1.5
 
-# کوoldown برای هر نماد (ساعت)
-COOLDOWN_HOURS = 4
+COOLDOWN_HOURS = 4  # هر نماد هر 4 ساعت یک بار
+FRESH_MINUTES = 5   # سیگنال تازه: 5 دقیقه صبر کن قبل از چک ورود
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -47,16 +47,14 @@ logger = logging.getLogger(__name__)
 
 # ==================== Data Stores ====================
 
-USER_SUBSCRIPTIONS = {}
-USER_PAYMENTS = {}
-VIP_SUBSCRIPTIONS = {}
-USER_LAST_PAYMENT_ID = {}
+USER_SUBSCRIPTIONS = {}      # user_id -> expiration datetime
+USER_PAYMENTS = {}           # user_id -> total stars paid
+VIP_SUBSCRIPTIONS = {}       # user_id -> expiration datetime
+USER_LAST_PAYMENT_ID = {}    # user_id -> latest payment charge id
 
-# ✅ کلید: نماد - مقدار: زمان آخرین سیگنال
-LAST_SIGNAL_TIME = {}  # {symbol: datetime}
-
-PENDING_CONFIRMATION = {}
-ACTIVE_SIGNALS = {}
+LAST_SIGNAL_TIME = {}        # {symbol: datetime}
+PENDING_CONFIRMATION = {}    # {user_id: {symbol: {...}}}
+ACTIVE_SIGNALS = {}          # {user_id: {symbol: {...}}}
 
 # ==================== توابع کمکی ====================
 
@@ -69,7 +67,6 @@ def can_send_signal_for_symbol(symbol: str) -> tuple:
     return True, 0
 
 def mark_signal_sent(symbol: str):
-    """ثبت کن که برای این نماد سیگنال فرستاده شد"""
     LAST_SIGNAL_TIME[symbol] = datetime.now()
 
 # ==================== CoinGecko API ====================
@@ -167,6 +164,7 @@ async def start(update: Update, context: CallbackContext):
         [InlineKeyboardButton("💳 اشتراک 1 ماهه — 1 ⭐", callback_data="buy_subscription")],
         [InlineKeyboardButton("🔥 اشتراک VIP — 2 ⭐", callback_data="buy_vip")],
         [InlineKeyboardButton("👤 وضعیت اشتراک من", callback_data="show_subscriptions")],
+        [InlineKeyboardButton("💰 ریفاند استارز", callback_data="refund_stars")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -174,6 +172,7 @@ async def start(update: Update, context: CallbackContext):
         "✨ **ربات سیگنال فوتچرز** ✨\n\n"
         "📊 هر نماد حداکثر **هر 4 ساعت** یک سیگنال\n"
         "🎯 بدون سیگنال تکراری\n"
+        "⏳ 5 دقیقه صبر قبل از چک ورود\n"
         "🔘 تایید/رد با ریپلای\n\n"
         "👇 انتخاب کن:",
         reply_markup=reply_markup,
@@ -220,6 +219,29 @@ async def button_handler(update: Update, context: CallbackContext):
         msg += f"🔸 VIP:\n{vip_expire if vip_expire else '❌ فعال نیست'}"
         await query.edit_message_text(msg, parse_mode="Markdown")
 
+    elif query.data == "refund_stars":
+        charge_id = USER_LAST_PAYMENT_ID.get(user_id)
+        if not charge_id:
+            await query.edit_message_text("❌ هیچ پرداختی برای ریفاند پیدا نشد.")
+            return
+        
+        try:
+            success = await context.bot.refund_star_payment(
+                user_id=user_id,
+                telegram_payment_charge_id=charge_id,
+            )
+            if success:
+                USER_SUBSCRIPTIONS.pop(user_id, None)
+                VIP_SUBSCRIPTIONS.pop(user_id, None)
+                USER_LAST_PAYMENT_ID.pop(user_id, None)
+                PENDING_CONFIRMATION.pop(user_id, None)
+                ACTIVE_SIGNALS.pop(user_id, None)
+                await query.edit_message_text("✅ **ریفاند با موفقیت انجام شد.**\nاستارز به حساب شما برگشت داده شد.")
+            else:
+                await query.edit_message_text("❌ ریفاند انجام نشد.")
+        except TelegramError as e:
+            await query.edit_message_text(f"⚠️ خطا در ریفاند:\n{e}")
+
     elif query.data.startswith("confirm_"):
         symbol = query.data.replace("confirm_", "")
         if user_id in PENDING_CONFIRMATION and symbol in PENDING_CONFIRMATION[user_id]:
@@ -239,13 +261,14 @@ async def button_handler(update: Update, context: CallbackContext):
                     f"📊 نوع: {signal_data['signal']}\n"
                     f"🎯 ورود: `{signal_data['entry']}`\n"
                     f"🛑 SL: `{signal_data['stop_loss']}`\n"
-                    f"🚀 TP: `{signal_data['take_profit']}`"
+                    f"🚀 TP: `{signal_data['take_profit']}`\n\n"
+                    f"💎 معامله فعال شد. ربات تارگت و حد ضرر رو بررسی میکنه."
                 ),
                 parse_mode="Markdown",
                 reply_to_message_id=original_msg_id,
             )
         else:
-            await query.edit_message_text("❌ سیگنال منقضی شده.")
+            await query.edit_message_text("❌ سیگنال منقضی شده یا وجود ندارد.")
 
     elif query.data.startswith("reject_"):
         symbol = query.data.replace("reject_", "")
@@ -255,7 +278,7 @@ async def button_handler(update: Update, context: CallbackContext):
             
             await context.bot.send_message(
                 chat_id=user_id,
-                text=f"❌ **ورود {symbol} رد شد** ❌",
+                text=f"❌ **ورود {symbol} رد شد** ❌\n\n⏳ سیگنال بسته شد.",
                 reply_to_message_id=original_msg_id,
             )
 
@@ -274,13 +297,21 @@ async def successful_payment_callback(update: Update, context: CallbackContext):
 
     if payment.invoice_payload.startswith("subscription:"):
         USER_SUBSCRIPTIONS[user_id] = datetime.now() + timedelta(days=30)
-        await update.message.reply_text(f"✅ اشتراک عادی فعال شد تا {USER_SUBSCRIPTIONS[user_id]}")
+        USER_PAYMENTS[user_id] = USER_PAYMENTS.get(user_id, 0) + payment.total_amount
+        USER_LAST_PAYMENT_ID[user_id] = payment.telegram_payment_charge_id
+        await update.message.reply_text(
+            f"✅ **اشتراک عادی فعال شد!** ✨\n\n📅 تا تاریخ: `{USER_SUBSCRIPTIONS[user_id]}`",
+            parse_mode="Markdown",
+        )
+
     elif payment.invoice_payload.startswith("vip:"):
         VIP_SUBSCRIPTIONS[user_id] = datetime.now() + timedelta(days=30)
-        await update.message.reply_text(f"🔥 اشتراک VIP فعال شد تا {VIP_SUBSCRIPTIONS[user_id]}")
-
-async def refund_command(update: Update, context: CallbackContext):
-    await update.message.reply_text("برای ریفاند با پشتیبانی تماس بگیرید.")
+        USER_PAYMENTS[user_id] = USER_PAYMENTS.get(user_id, 0) + payment.total_amount
+        USER_LAST_PAYMENT_ID[user_id] = payment.telegram_payment_charge_id
+        await update.message.reply_text(
+            f"🔥 **اشتراک VIP فعال شد!** 🔥\n\n📅 تا تاریخ: `{VIP_SUBSCRIPTIONS[user_id]}`",
+            parse_mode="Markdown",
+        )
 
 # ==================== ارسال سیگنال نهایی ====================
 
@@ -307,8 +338,9 @@ async def send_final_signal(context: CallbackContext, user_id: int, signal: dict
         f"📈 1h: `{signal['change_1h']:+.2f}%` | 24h: `{signal['change_24h']:+.2f}%`\n"
         f"💎 حجم: `${signal['volume']:,.0f}`\n\n"
         f"🏷️ {risk_tag}\n\n"
-        f"⏳ منتظر ورود به محدوده `{signal['entry_zone_low']}` تا `{signal['entry_zone_high']}`...\n\n"
-        f"🔘 وقتی وارد شد، دکمه تایید رو بزن."
+        f"⏳ **صبر کنید...** ربات بعد از {FRESH_MINUTES} دقیقه قیمت رو چک میکنه.\n"
+        f"وقتی قیمت وارد محدوده `{signal['entry_zone_low']}` تا `{signal['entry_zone_high']}` شد، بهت اطلاع میدم.\n\n"
+        f"🔘 بعد از اعلام ورود، دکمه تایید رو بزن."
     )
     
     try:
@@ -319,10 +351,13 @@ async def send_final_signal(context: CallbackContext, user_id: int, signal: dict
             parse_mode="Markdown",
         )
         
+        # ✅ ذخیره با FRESH_MINUTES دقیقه تازه بودن
         PENDING_CONFIRMATION.setdefault(user_id, {})[signal["symbol"]] = {
             "signal": signal,
             "message_id": msg.message_id,
             "timestamp": datetime.now(),
+            "fresh_until": datetime.now() + timedelta(minutes=FRESH_MINUTES),
+            "notified": False,
         }
         
         logger.info(f"✅ Signal: {signal['symbol']} {signal['signal']} entry:{signal['entry']}")
@@ -331,7 +366,7 @@ async def send_final_signal(context: CallbackContext, user_id: int, signal: dict
         logger.error(f"Send error: {e}")
         return False
 
-# ==================== بررسی قیمت و اطلاع ====================
+# ==================== بررسی قیمت و اطلاع (با تاخیر) ====================
 
 async def check_price_for_entry_job(context: CallbackContext):
     coins = await fetch_all_coins()
@@ -344,8 +379,13 @@ async def check_price_for_entry_job(context: CallbackContext):
         for symbol, data in list(signals.items()):
             signal = data["signal"]
             original_msg_id = data["message_id"]
-            current_price = price_map.get(symbol)
+            fresh_until = data.get("fresh_until")
             
+            # ✅ اگه سیگنال تازه است (کمتر از FRESH_MINUTES دقیقه از ارسالش گذشته)، هنوز چک نکن
+            if fresh_until and datetime.now() < fresh_until:
+                continue
+            
+            current_price = price_map.get(symbol)
             if not current_price:
                 continue
             
@@ -360,20 +400,28 @@ async def check_price_for_entry_job(context: CallbackContext):
                     text=(
                         f"🟢 **قیمت {symbol} وارد محدوده شد!** 🟢\n\n"
                         f"💰 قیمت فعلی: `${current_price}`\n"
-                        f"✅ دکمه تایید رو بزن."
+                        f"📊 محدوده مجاز: `{signal['entry_zone_low']}` ➜ `{signal['entry_zone_high']}`\n\n"
+                        f"✅ **برای تایید ورود، روی دکمه ✅ تایید کلیک کن**\n"
+                        f"❌ یا اگر نمیخوای وارد بشی، روی ❌ رد بزن."
                     ),
                     parse_mode="Markdown",
                     reply_to_message_id=original_msg_id,
                 )
-                logger.info(f"🟢 Entry zone: {symbol}")
+                logger.info(f"🟢 Entry zone reached: {symbol} for user {user_id}")
             
+            # انقضای 2 ساعته
             if (datetime.now() - data["timestamp"]).seconds > 7200:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"⏰ سیگنال {symbol} منقضی شد.",
-                    reply_to_message_id=original_msg_id,
-                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"⏰ **سیگنال {symbol} منقضی شد**\n\nزمان ۲ ساعت به پایان رسید.",
+                        parse_mode="Markdown",
+                        reply_to_message_id=original_msg_id,
+                    )
+                except Exception:
+                    pass
                 del PENDING_CONFIRMATION[user_id][symbol]
+                logger.info(f"⏰ Signal expired: {symbol}")
 
 # ==================== تولید سیگنال (بدون تکرار) ====================
 
@@ -395,14 +443,12 @@ async def signal_job_fast(context: CallbackContext):
     for signal in signals_found:
         symbol = signal["symbol"]
         
-        # ✅ بررسی کن برای این نماد توی 4 ساعت اخیر سیگنال فرستاده شده یا نه
         can_send, wait_hours = can_send_signal_for_symbol(symbol)
         
         if not can_send:
             logger.info(f"⏸️ Skipping {symbol} - cooldown {wait_hours}h left")
             continue
         
-        # ارسال به کاربران
         for user_id, expire in list(USER_SUBSCRIPTIONS.items()):
             if expire >= now:
                 await send_final_signal(context, user_id, signal)
@@ -413,9 +459,7 @@ async def signal_job_fast(context: CallbackContext):
                 await send_final_signal(context, user_id, signal)
                 await asyncio.sleep(0.1)
         
-        # ثبت زمان آخرین سیگنال برای این نماد
         mark_signal_sent(symbol)
-        
         logger.info(f"📤 Sent signal for {symbol}")
 
 # ==================== بررسی تارگت و حد ضرر ====================
@@ -452,21 +496,31 @@ async def check_targets_job(context: CallbackContext):
             if hit_tp:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"🎯 **تارگت {symbol} تاچ شد!** ✅\n\n📈 سود: `+{profit_pct:.2f}%`",
+                    text=(
+                        f"🎯 **تارگت {symbol} تاچ شد!** ✅\n\n"
+                        f"📈 سود: `+{profit_pct:.2f}%`\n"
+                        f"💰 قیمت بسته شدن: `${current_price}`"
+                    ),
                     parse_mode="Markdown",
                     reply_to_message_id=original_msg_id,
                 )
                 del ACTIVE_SIGNALS[user_id][symbol]
+                logger.info(f"🎯 TP: {symbol} +{profit_pct:.2f}%")
             elif hit_sl:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"🛑 **حد ضرر {symbol} فعال شد!**\n\n📉 ضرر: `{profit_pct:.2f}%`",
+                    text=(
+                        f"🛑 **حد ضرر {symbol} فعال شد!**\n\n"
+                        f"📉 ضرر: `{profit_pct:.2f}%`\n"
+                        f"💰 قیمت بسته شدن: `${current_price}`"
+                    ),
                     parse_mode="Markdown",
                     reply_to_message_id=original_msg_id,
                 )
                 del ACTIVE_SIGNALS[user_id][symbol]
+                logger.info(f"🛑 SL: {symbol} {profit_pct:.2f}%")
 
-# ==================== VIP ====================
+# ==================== VIP Signals ====================
 
 async def vip_signal_job(context: CallbackContext):
     coins = await fetch_all_coins()
@@ -490,14 +544,42 @@ async def vip_signal_job(context: CallbackContext):
     if not can_send:
         return
     
-    vip_text = f"👑 VIP: {best['symbol']} {best['signal']}\n🎯 ورود: {best['entry']}\n🛑 SL: {best['stop_loss']}\n🚀 TP: {best['take_profit']}"
+    vip_text = (
+        f"👑 **سیگنال ویژه VIP** 👑\n\n"
+        f"✨ **{best['symbol']} - {best['signal']}** ✨\n\n"
+        f"🎯 ورود: `{best['entry']}`\n"
+        f"🛑 SL: `{best['stop_loss']}`\n"
+        f"🚀 TP: `{best['take_profit']}`\n\n"
+        f"📊 حجم: `${best['volume']:,.0f}`\n"
+        f"📈 تغییر ۱ ساعت: `{best['change_1h']:+.2f}%`\n\n"
+        f"🌟 این سیگنال فقط برای VIPها ارسال شده."
+    )
     
     now = datetime.now()
     for user_id, expire in list(VIP_SUBSCRIPTIONS.items()):
         if expire >= now:
-            await context.bot.send_message(chat_id=user_id, text=vip_text)
+            await context.bot.send_message(chat_id=user_id, text=vip_text, parse_mode="Markdown")
+            await asyncio.sleep(0.3)
     
     mark_signal_sent(best["symbol"])
+    logger.info(f"👑 VIP signal: {best['symbol']}")
+
+# ==================== Cleanup ====================
+
+async def cleanup_old_job(context: CallbackContext):
+    """پاک کردن داده‌های قدیمی"""
+    now = datetime.now()
+    
+    # پاک کردن سیگنال‌های منقضی شده
+    for user_id in list(PENDING_CONFIRMATION.keys()):
+        for symbol in list(PENDING_CONFIRMATION[user_id].keys()):
+            if (now - PENDING_CONFIRMATION[user_id][symbol]["timestamp"]).seconds > 7200:
+                del PENDING_CONFIRMATION[user_id][symbol]
+    
+    # پاک کردن کوoldown قدیمی (بعد از 5 ساعت)
+    for symbol in list(LAST_SIGNAL_TIME.keys()):
+        if (now - LAST_SIGNAL_TIME[symbol]).seconds > 18000:
+            del LAST_SIGNAL_TIME[symbol]
 
 # ==================== Main ====================
 
@@ -505,7 +587,6 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("refund", refund_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
@@ -514,9 +595,13 @@ def main():
     app.job_queue.run_repeating(check_price_for_entry_job, interval=PRICE_CHECK_INTERVAL, first=3)
     app.job_queue.run_repeating(check_targets_job, interval=TARGET_CHECK_INTERVAL, first=10)
     app.job_queue.run_repeating(vip_signal_job, interval=VIP_SIGNAL_INTERVAL, first=30)
+    app.job_queue.run_repeating(cleanup_old_job, interval=1800, first=60)
     
     logger.info("=" * 50)
-    logger.info(f"✅ ربات اجرا شد - هر نماد هر {COOLDOWN_HOURS} ساعت یک بار")
+    logger.info(f"✅ ربات اجرا شد")
+    logger.info(f"📊 هر نماد هر {COOLDOWN_HOURS} ساعت یک بار")
+    logger.info(f"⏳ {FRESH_MINUTES} دقیقه صبر قبل از چک ورود")
+    logger.info(f"💰 ریفاند استارز فعال")
     logger.info("=" * 50)
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
